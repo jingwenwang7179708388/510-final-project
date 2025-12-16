@@ -1,425 +1,388 @@
 """
-DSCI 510 Final Project - Data Collection
+get_data.py
 
-This script scrapes BBC News articles from selected sections and saves:
-1) raw HTML files in data/raw/
-2) a metadata CSV in data/raw/articles_metadata.csv
+Download (scrape) BBC News articles and save:
+1) Raw HTML files to: data/raw/html/
+2) Metadata CSV to:  data/raw/metadata.csv
 
-Run:
+This script is designed for the DSCI 510 final project repository structure.
+
+Usage (from project root):
     python src/get_data.py
+
+Notes:
+- We collect articles from BBC section landing pages (World, Business, Technology).
+- We attempt to parse publication date from <time datetime="..."> when available.
+- We store headline text and a short body preview (first few paragraphs).
 """
 
 from __future__ import annotations
 
-import csv
+import hashlib
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
-from urllib.parse import urljoin, urlparse
 
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+from dateutil import parser as date_parser
 
 
 # -----------------------------
 # Configuration
 # -----------------------------
-BASE_URL = "https://www.bbc.com"
 
-SECTIONS: Dict[str, str] = {
-    "world": f"{BASE_URL}/news/world",
-    "business": f"{BASE_URL}/news/business",
-    "technology": f"{BASE_URL}/news/technology",
-}
-
-ARTICLES_PER_SECTION = 50          # target per section (you can change)
-MAX_PAGES_PER_SECTION = 60         # safety cap to avoid infinite paging
-SLEEP_BETWEEN_REQUESTS = 1.0       # polite delay between requests (seconds)
-REQUEST_TIMEOUT = 15               # seconds
-
-MIN_WORDS = 80                     # skip very short articles
-
-USER_AGENT = (
+USER_AGENT: str = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-HEADERS = {"User-Agent": USER_AGENT}
+REQUEST_TIMEOUT: int = 15
+SLEEP_SECONDS: float = 1.0  # be polite to the website
+MAX_ARTICLES_PER_SECTION: int = 120  # target ~100 each after filtering
+MIN_BODY_WORDS: int = 60  # filter out nav pages / very short content
 
-# Project paths (repo root is parent of src/)
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RAW_DIR = PROJECT_ROOT / "data" / "raw"
-RAW_DIR.mkdir(parents=True, exist_ok=True)
+SECTIONS: Dict[str, str] = {
+    "world": "https://www.bbc.com/news/world",
+    "business": "https://www.bbc.com/news/business",
+    "technology": "https://www.bbc.com/news/technology",
+}
 
-METADATA_CSV = RAW_DIR / "articles_metadata.csv"
+# Event-specific keywords used for BBC search expansion
+SECTION_KEYWORDS = {
+    "world": ["election", "Trump", "Biden", "Ukraine", "Israel", "China", "Russia", "war"],
+    "business": ["inflation", "Fed", "interest rates", "stocks", "markets", "tariffs", "oil", "jobs", "economy", "earnings"],
+    "technology": ["AI", "OpenAI", "Google", "Apple", "Microsoft", "chip", "semiconductor", "quantum", "cyber", "TikTok"],
+}
+
+
+PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
+RAW_DIR: Path = PROJECT_ROOT / "data" / "raw"
+RAW_HTML_DIR: Path = RAW_DIR / "html"
+METADATA_PATH: Path = RAW_DIR / "metadata.csv"
 
 
 # -----------------------------
-# Data containers
+# Data Structures
 # -----------------------------
-@dataclass
+
+@dataclass(frozen=True)
 class ArticleRecord:
-    """Structured record for one BBC article."""
-    article_id: str
     url: str
     section: str
-    title: str
-    publish_date: str  # ISO format if possible, else raw string
-    body_text: str
-    word_count: int
-    raw_html_path: str  # relative path from project root
+    published_at: Optional[str]  # ISO 8601 string if available
+    headline: str
+    body_preview: str
+    raw_html_path: str
 
 
 # -----------------------------
-# Helpers: networking
+# Helpers
 # -----------------------------
-def fetch_html(url: str) -> Optional[str]:
+
+def ensure_dirs() -> None:
+    """Create required output directories if they do not exist."""
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    RAW_HTML_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def normalize_bbc_url(url: str) -> str:
     """
-    Fetch HTML for a URL.
-
-    Args:
-        url (str): Target URL.
-
-    Returns:
-        Optional[str]: HTML string if success, else None.
+    Normalize BBC URLs:
+    - Convert relative URLs to absolute (bbc.com)
+    - Convert bbc.co.uk to bbc.com (so filters work consistently)
+    - Strip fragments and query params
     """
-    try:
-        print(f"[GET] {url}")
-        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        return resp.text
-    except requests.RequestException as e:
-        print(f"[ERROR] Failed to fetch {url}: {e}")
-        return None
+    url = url.strip()
+    if url.startswith("/"):
+        url = "https://www.bbc.com" + url
+
+    # unify domain
+    url = url.replace("https://www.bbc.co.uk", "https://www.bbc.com")
+    url = url.replace("http://www.bbc.co.uk", "https://www.bbc.com")
+    url = url.replace("http://www.bbc.com", "https://www.bbc.com")
+
+    # Remove fragments
+    url = url.split("#", 1)[0]
+    # Remove query params
+    url = re.sub(r"\?.*$", "", url)
+
+    return url
 
 
-# -----------------------------
-# Helpers: URL filtering
-# -----------------------------
-def is_article_url(url: str) -> bool:
+
+def is_probably_article_url(url: str) -> bool:
     """
-    Return True only if the URL looks like a real BBC article page.
-
-    Accept only:
-        1) https://www.bbc.com/news/articles/<id>
-        2) https://www.bbc.com/news/<slug>-<digits>
-
-    Reject:
-        /live/, /av/, /video/, /tv/, /sounds/, /topics/, etc.
-        section landing pages like /news/world, /news/us-canada, /news/war-in-ukraine
+    Strict article URL filter:
+    Accept only real article patterns such as:
+    - https://www.bbc.com/news/articles/<id>
+    - https://www.bbc.com/news/<section>/<cxxxxxxxxxx>  (article id usually starts with 'c')
+    Reject section/region landing pages like /news/world/africa or /news/world/asia
     """
-    if not url.startswith(f"{BASE_URL}/news"):
+    if not url.startswith("https://www.bbc.com/news"):
         return False
 
-    bad_patterns = ["/live/", "/av/", "/video/", "/tv/", "/sounds/", "/topics/", "/in_pictures", "/special/"]
-    if any(p in url for p in bad_patterns):
+    bad_keywords = ["/videos/", "/live/", "/topics/", "/av/", "/in_pictures", "/special/", "/resources/"]
+    if any(k in url for k in bad_keywords):
         return False
 
-    path = urlparse(url).path  # e.g. "/news/articles/c62v7n9wzkyo"
-
-    # (1) /news/articles/<id>
-    if path.startswith("/news/articles/"):
+    # Pattern 1: /news/articles/<id>
+    if re.search(r"^https://www\.bbc\.com/news/articles/[a-z0-9]+$", url):
         return True
 
-    # (2) /news/<slug>-<digits>  (must end with digits)
-    # Example: /news/world-europe-12345678
-    if re.match(r"^/news/[^/]+-\d+$", path):
+    # Pattern 2: /news/<something>/<article_id> where article_id often starts with 'c'
+    if re.search(r"^https://www\.bbc\.com/news/[^/]+/c[a-z0-9]{8,}$", url):
         return True
 
     return False
 
 
-def extract_article_links_from_section_page(html: str) -> List[str]:
-    """
-    Extract candidate article URLs from a BBC section landing page HTML.
 
-    Args:
-        html (str): HTML of section page.
+def safe_filename_from_url(url: str) -> str:
+    """Create a stable filename for a URL using a short hash."""
+    h = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    return f"{h}.html"
 
-    Returns:
-        List[str]: List of absolute URLs (filtered to real article patterns).
+
+def fetch_html(url: str) -> str:
+    """Download HTML from a URL and return text. Raises for bad status codes."""
+    headers = {"User-Agent": USER_AGENT}
+    resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp.text
+
+
+def extract_links_from_section(section_url: str) -> List[str]:
     """
+    Fetch a section landing page and extract candidate article links.
+    Returns a de-duplicated list of normalized URLs.
+    """
+    html = fetch_html(section_url)
     soup = BeautifulSoup(html, "html.parser")
-    urls: Set[str] = set()
 
+    urls: List[str] = []
     for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
+        href = normalize_bbc_url(a["href"])
+        if is_probably_article_url(href):
+            urls.append(href)
 
-        # Normalize to absolute
-        full_url = urljoin(BASE_URL, href)
+    # Deduplicate while preserving order
+    seen: Set[str] = set()
+    unique_urls: List[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            unique_urls.append(u)
+    return unique_urls
 
-        if is_article_url(full_url):
-            urls.add(full_url)
-
-    return sorted(urls)
-
-
-# -----------------------------
-# Helpers: parsing article HTML
-# -----------------------------
-def parse_publish_date(soup: BeautifulSoup) -> str:
+def extract_links_from_bbc_search(query: str, max_pages: int = 10) -> List[str]:
     """
-    Try to parse publish date from BBC article HTML.
-
-    Returns:
-        str: ISO string if parseable, else empty string.
+    Use BBC search pages to collect more article URLs.
+    BBC search URL pattern (can change, but usually works):
+        https://www.bbc.co.uk/search?q=<query>&page=<n>
     """
-    # Common pattern: <time datetime="2025-12-14T...Z">
-    time_tag = soup.find("time")
-    if time_tag and time_tag.has_attr("datetime"):
-        dt_raw = time_tag["datetime"].strip()
-        # keep as ISO if already ISO-ish
-        return dt_raw
+    base = "https://www.bbc.co.uk/search"
+    collected: List[str] = []
+    seen: Set[str] = set()
 
-    return ""
+    for page in range(1, max_pages + 1):
+        params = {"q": query, "page": page}
+        print(f"[SEARCH] q='{query}' page={page}")
+        html = requests.get(base, params=params, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT).text
+        soup = BeautifulSoup(html, "html.parser")
 
+        # search results usually contain <a href="..."> to news pages
+        for a in soup.find_all("a", href=True):
+            href = normalize_bbc_url(a["href"])
+            if is_probably_article_url(href) and href not in seen:
+                seen.add(href)
+                collected.append(href)
 
-def parse_title(soup: BeautifulSoup) -> str:
-    """
-    Parse title from BBC article HTML.
+        time.sleep(SLEEP_SECONDS)
 
-    Returns:
-        str: Title text.
-    """
-    h1 = soup.find("h1")
-    if h1:
-        title = h1.get_text(" ", strip=True)
-        if title:
-            return title
-    return ""
-
-
-def parse_body_text(soup: BeautifulSoup) -> str:
-    """
-    Parse the main body text from BBC article HTML.
-
-    Strategy:
-        - BBC articles typically have multiple <p> tags in the article body.
-        - We collect paragraph text and join.
-
-    Returns:
-        str: Article body text (joined).
-    """
-    paragraphs: List[str] = []
-
-    # Try to prioritize paragraphs inside <main> if present
-    main = soup.find("main")
-    scope = main if main else soup
-
-    for p in scope.find_all("p"):
-        txt = p.get_text(" ", strip=True)
-        if not txt:
-            continue
-        # Filter out very short boilerplate fragments
-        if len(txt) < 20:
-            continue
-        paragraphs.append(txt)
-
-    # De-duplicate consecutive duplicates (sometimes repeated in page)
-    cleaned: List[str] = []
-    for t in paragraphs:
-        if not cleaned or cleaned[-1] != t:
-            cleaned.append(t)
-
-    return "\n".join(cleaned).strip()
-
-
-def derive_article_id(url: str) -> str:
-    """
-    Derive a stable article_id from URL.
-
-    For /news/articles/<id> -> use <id>
-    For /news/<slug>-<digits> -> use <digits>
-    """
-    path = urlparse(url).path
-
-    if path.startswith("/news/articles/"):
-        return path.split("/news/articles/")[-1].strip("/")
-
-    m = re.match(r"^/news/[^/]+-(\d+)$", path)
-    if m:
-        return m.group(1)
-
-    # Fallback: last segment
-    last = path.strip("/").split("/")[-1]
-    return last or "article"
-
-
-def save_raw_html(html: str, section: str, article_id: str) -> Path:
-    """
-    Save raw HTML to data/raw/.
-
-    Returns:
-        Path: absolute file path saved.
-    """
-    filename = f"{section}_{article_id}.html"
-    out_path = RAW_DIR / filename
-    out_path.write_text(html, encoding="utf-8")
-    return out_path
-
-
-# -----------------------------
-# Metadata CSV handling
-# -----------------------------
-def ensure_metadata_header(path: Path) -> None:
-    """
-    Ensure metadata CSV exists and has header row.
-    """
-    if path.exists():
-        return
-
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "article_id",
-            "url",
-            "section",
-            "title",
-            "publish_date",
-            "body_text",
-            "word_count",
-            "raw_html_path",
-        ])
-
-
-def append_metadata_row(path: Path, rec: ArticleRecord) -> None:
-    """
-    Append one record to the metadata CSV.
-    """
-    with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            rec.article_id,
-            rec.url,
-            rec.section,
-            rec.title,
-            rec.publish_date,
-            rec.body_text,
-            rec.word_count,
-            rec.raw_html_path,
-        ])
-
-
-# -----------------------------
-# Main scraping logic
-# -----------------------------
-def scrape_section(section: str, start_url: str, target_count: int) -> int:
-    """
-    Scrape one BBC section until target_count valid articles are collected.
-
-    Args:
-        section (str): section name, e.g. 'world'
-        start_url (str): section landing page URL
-        target_count (int): desired number of valid articles
-
-    Returns:
-        int: number of collected valid articles
-    """
-    print(f"\n===== Scraping section: {section} =====")
-    collected = 0
-    seen_urls: Set[str] = set()
-    no_new_url_pages = 0
-
-    for page in range(0, MAX_PAGES_PER_SECTION):
-        if page == 0:
-            url = start_url
-        else:
-            url = f"{start_url}?page={page}"
-
-        html = fetch_html(url)
-        if html is None:
-            print(f"[WARN] Failed to load section page {url}, stopping section.")
-            break
-
-        candidate_urls = extract_article_links_from_section_page(html)
-        print(f"[INFO] Page {page}: Found {len(candidate_urls)} candidate article URLs")
-
-        # Filter new URLs only
-        new_urls = [u for u in candidate_urls if u not in seen_urls]
-        if not new_urls:
-            no_new_url_pages += 1
-        else:
-            no_new_url_pages = 0
-
-        if no_new_url_pages >= 3:
-            print("[INFO] No new URLs for 3 pages, stopping section.")
-            break
-
-        for article_url in new_urls:
-            if collected >= target_count:
-                break
-
-            seen_urls.add(article_url)
-
-            article_html = fetch_html(article_url)
-            if article_html is None:
-                continue
-
-            soup = BeautifulSoup(article_html, "html.parser")
-
-            title = parse_title(soup)
-            pub_date = parse_publish_date(soup)
-            body = parse_body_text(soup)
-
-            # Basic validity checks
-            word_count = len(body.split())
-            if not title or word_count < MIN_WORDS:
-                if word_count < MIN_WORDS:
-                    print(f"[INFO] Skipping very short article ({word_count} words): {article_url}")
-                else:
-                    print(f"[INFO] Skipping missing-title article: {article_url}")
-                continue
-
-            article_id = derive_article_id(article_url)
-
-            raw_path = save_raw_html(article_html, section, article_id)
-            raw_rel = str(raw_path.relative_to(PROJECT_ROOT))
-
-            rec = ArticleRecord(
-                article_id=article_id,
-                url=article_url,
-                section=section,
-                title=title,
-                publish_date=pub_date,
-                body_text=body,
-                word_count=word_count,
-                raw_html_path=raw_rel,
-            )
-
-            append_metadata_row(METADATA_CSV, rec)
-            collected += 1
-            print(f"[OK] {section}: collected {collected}/{target_count}")
-
-            time.sleep(SLEEP_BETWEEN_REQUESTS)
-
-        # polite delay between section pages
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
-
-        if collected >= target_count:
-            break
-
-    print(f"[DONE] Section {section}: collected {collected} valid articles.")
     return collected
 
 
-def run() -> None:
+def parse_article_page(html: str) -> Tuple[str, Optional[str], str]:
     """
-    Run the full data collection pipeline for all sections.
+    Parse an article HTML page and return:
+    (headline, published_at_iso, body_preview)
+
+    We try multiple strategies since site HTML can vary.
     """
-    ensure_metadata_header(METADATA_CSV)
+    soup = BeautifulSoup(html, "html.parser")
 
-    total = 0
-    for section, url in SECTIONS.items():
-        total += scrape_section(section, url, ARTICLES_PER_SECTION)
+    # Headline
+    headline = ""
+    h1 = soup.find("h1")
+    if h1 and h1.get_text(strip=True):
+        headline = h1.get_text(strip=True)
 
-    print(f"\n===== DONE: collected {total} total valid articles across sections =====")
-    print(f"[INFO] Metadata CSV: {METADATA_CSV}")
-    print(f"[INFO] Raw HTML dir: {RAW_DIR}")
+    # Publication date
+    published_at_iso: Optional[str] = None
+    time_tag = soup.find("time")
+    if time_tag and time_tag.has_attr("datetime"):
+        dt_raw = str(time_tag["datetime"]).strip()
+        try:
+            published_at_iso = date_parser.parse(dt_raw).isoformat()
+        except Exception:
+            published_at_iso = None
+
+    # Body text: collect paragraphs inside <article> when possible
+    body_texts: List[str] = []
+    article_tag = soup.find("article")
+    if article_tag:
+        ps = article_tag.find_all("p")
+    else:
+        ps = soup.find_all("p")
+
+    for p in ps:
+        txt = p.get_text(" ", strip=True)
+        # Filter out empty / boilerplate bits
+        if txt and len(txt.split()) >= 5:
+            body_texts.append(txt)
+
+    # Keep only the first few paragraphs (preview)
+    body_preview = " ".join(body_texts[:5]).strip()
+
+    return headline, published_at_iso, body_preview
+
+
+def save_raw_html(url: str, html: str) -> Path:
+    """Save raw HTML to data/raw/html/<hash>.html and return the path."""
+    filename = safe_filename_from_url(url)
+    path = RAW_HTML_DIR / filename
+    path.write_text(html, encoding="utf-8")
+    return path
+
+
+def looks_like_section_landing(headline: str, body_preview: str) -> bool:
+    """
+    Some BBC URLs that pass heuristics can still be section/topic landing pages.
+    If headline/body looks uninformative, we skip.
+    """
+    if not headline:
+        return True
+    if headline.lower() in {"news", "bbc news", "world", "business", "technology"}:
+        return True
+    if len(body_preview.split()) < MIN_BODY_WORDS:
+        return True
+    return False
+
+
+def collect_section_articles(section_name: str, section_url: str) -> List[ArticleRecord]:
+    """
+    Collect articles for a single section:
+    - fetch section page
+    - extract candidate URLs
+    - fetch each article page until reaching MAX_ARTICLES_PER_SECTION
+    """
+    print(f"\n===== Scraping section: {section_name} =====")
+
+    candidate_urls = extract_links_from_section(section_url)
+
+    # Expand using BBC search (to reach enough articles)
+    # Combine section name + event keywords to bias results into relevant sections/topics
+    search_urls: List[str] = []
+    for kw in SECTION_KEYWORDS.get(section_name, []):
+        q = f"{section_name} {kw}"
+        search_urls.extend(extract_links_from_bbc_search(q, max_pages=20))
+
+    # Merge and deduplicate (preserve order)
+    merged: List[str] = []
+    seen_merge: Set[str] = set()
+    for u in candidate_urls + search_urls:
+        if u not in seen_merge:
+            seen_merge.add(u)
+            merged.append(u)
+
+    candidate_urls = merged
+    print(f"[INFO] Expanded candidate URLs (section+search): {len(candidate_urls)}")
+    print(f"[INFO] Found {len(candidate_urls)} candidate article URLs")
+
+    records: List[ArticleRecord] = []
+    visited: Set[str] = set()
+
+    for url in candidate_urls:
+        if url in visited:
+            continue
+        visited.add(url)
+
+        if len(records) >= MAX_ARTICLES_PER_SECTION:
+            break
+
+        try:
+            print(f"[GET] {url}")
+            html = fetch_html(url)
+            headline, published_at_iso, body_preview = parse_article_page(html)
+
+            if looks_like_section_landing(headline, body_preview):
+                print(f"[SKIP] Not an article / too short: {headline[:50]}")
+                continue
+
+            raw_path = save_raw_html(url, html)
+
+            rec = ArticleRecord(
+                url=url,
+                section=section_name,
+                published_at=published_at_iso,
+                headline=headline,
+                body_preview=body_preview,
+                raw_html_path=str(raw_path.relative_to(PROJECT_ROOT)),
+            )
+            records.append(rec)
+            print(f"[OK] Saved: {headline[:60]}")
+
+            time.sleep(SLEEP_SECONDS)
+
+        except requests.HTTPError as e:
+            print(f"[ERROR] HTTP error for {url}: {e}")
+        except requests.RequestException as e:
+            print(f"[ERROR] Request error for {url}: {e}")
+        except Exception as e:
+            print(f"[ERROR] Unexpected error for {url}: {e}")
+
+    print(f"[DONE] {section_name}: collected {len(records)} articles")
+    return records
+
+
+def write_metadata_csv(records: List[ArticleRecord]) -> None:
+    """Write metadata records to data/raw/metadata.csv."""
+    rows = []
+    for r in records:
+        rows.append(
+            {
+                "url": r.url,
+                "section": r.section,
+                "published_at": r.published_at,
+                "headline": r.headline,
+                "body_preview": r.body_preview,
+                "raw_html_path": r.raw_html_path,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    df.to_csv(METADATA_PATH, index=False, encoding="utf-8")
+    print(f"\n[WRITE] Metadata CSV saved to: {METADATA_PATH.relative_to(PROJECT_ROOT)}")
+    print(f"[INFO] Total rows: {len(df)}")
+
+
+def main() -> None:
+    """Main entry point for scraping all sections and saving outputs."""
+    ensure_dirs()
+
+    all_records: List[ArticleRecord] = []
+    for section_name, section_url in SECTIONS.items():
+        recs = collect_section_articles(section_name, section_url)
+        all_records.extend(recs)
+
+    write_metadata_csv(all_records)
+    print("\n✅ Scraping completed successfully.")
 
 
 if __name__ == "__main__":
-    run()
+    main()
